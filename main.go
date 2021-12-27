@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"cloud.google.com/go/storage"
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -8,12 +11,14 @@ import (
 	"image/jpeg"
 	_ "image/jpeg"
 	"image/png"
+	"io"
+	"io/ioutil"
+	"log"
 	"math"
-	"mime/multipart"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/disintegration/imaging"
 	"github.com/gin-gonic/gin"
@@ -21,113 +26,89 @@ import (
 
 func main() {
 	r := gin.Default()
-	r.POST("/upload/calculate", func(c *gin.Context) {
-		f, err := c.FormFile("file_input")
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": err.Error(),
-			})
-			return
-		}
-
-		blobFile, err := f.Open()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": err.Error(),
-			})
-			return
-		}
-
-		width, height := resolveImageMeta(blobFile, f.Filename)
-		fs := float64(f.Size)
-		c.JSON(200, gin.H{
-			"width":    width,
-			"height":   height,
-			"fileSize": HumanFileSize(fs),
-		})
-	})
-	r.POST("/upload/addwatermark", func(c *gin.Context) {
-		f, err := c.FormFile("file_input")
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": err.Error(),
-			})
-			return
-		}
-		blobFile, err := f.Open()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": err.Error(),
-			})
-			return
-		}
-		image := generateWatermark(blobFile, f.Filename)
-
-		c.JSON(200, gin.H{
-			"path": "image/" + image,
-		})
-	})
-	r.POST("/upload/thumbnail", func(c *gin.Context) {
-		f, err := c.FormFile("file_input")
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": err.Error(),
-			})
-			return
-		}
-		blobFile, err := f.Open()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": err.Error(),
-			})
-			return
-		}
-		width, height, image := generateThumbnail(blobFile, f.Filename)
-
-		c.JSON(200, gin.H{
-			"path":   "image/" + image,
-			"width":  width,
-			"height": height,
-		})
-	})
+	r.POST("/upload/calculate", resolveImageMeta)
+	r.POST("/upload/addwatermark", generateWatermark)
+	r.POST("/upload/thumbnail", generateThumbnail)
 	r.Run()
 }
 
-func generateThumbnail(file multipart.File, filename string) (int, int, string) {
+func generateThumbnail(c *gin.Context) {
+	var client ClientImageSize
+	c.BindJSON(&client)
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, time.Second*50)
+	defer cancel()
 
-	img, err := jpeg.Decode(file)
+	rc, err := clientDetail.cl.Bucket(client.BucketName).Object(client.Path).NewReader(ctx)
+
+	if err != nil {
+		fmt.Println("io.Copy: %v", err)
+	}
+	defer rc.Close()
+
+	Image400x300 := fileNameWithoutExtSliceNotation(client.Path) + "-400x300" + fileExtSliceNotation(client.Path)
+
+	img, err := jpeg.Decode(rc)
 	if err != nil {
 		panic(err)
 	}
 	var newFilename string
 	var newWidth int
 	var newHeight int
-	width := img.Bounds().Dx()
+	width := client.Width
 	height := img.Bounds().Dy()
 	if width >= 800 {
-		newFilename = filename
-		fmt.Print(width)
-		fmt.Print(height)
+		newFilename = client.Path
 		newWidth = width
 		newHeight = height
 	} else if width <= 400 {
-		newFilename = (fileNameWithoutExtSliceNotation(filename) + "-400x300" + fileExtSliceNotation(filename))
+		newFilename = Image400x300
 		newimage := imaging.Resize(img, 400, 300, imaging.Box)
-		imaging.Save(newimage, newFilename)
+		imgw, _ := os.Create("ImageSize.jpg")
+		jpeg.Encode(imgw, newimage, &jpeg.Options{jpeg.DefaultQuality})
 		newWidth = 400
 		newHeight = 300
+		uploadimg, err := os.Open("ImageSize.jpg")
+		if err != nil {
+			log.Fatalf("failed to open: %s", err)
+		}
+
+		wc := clientDetail.cl.Bucket(client.BucketName).Object(Image400x300).NewWriter(ctx)
+		if _, err := io.Copy(wc, uploadimg); err != nil {
+			fmt.Errorf("io.Copy: %v", err)
+		}
+		if err := wc.Close(); err != nil {
+			fmt.Errorf("Writer.Close: %v", err)
+		}
 	}
 
-	return newWidth, newHeight, newFilename
+	c.JSON(200, gin.H{
+		"path":   newFilename,
+		"width":  newWidth,
+		"height": newHeight,
+	})
 }
 
-func generateWatermark(file multipart.File, filename string) string {
+func generateWatermark(c *gin.Context) {
+	var client Client
+	c.BindJSON(&client)
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, time.Second*50)
+	defer cancel()
 
-	first, err := jpeg.Decode(file)
+	rc, err := clientDetail.cl.Bucket(client.BucketName).Object(client.Path).NewReader(ctx)
+
+	if err != nil {
+		fmt.Println("io.Copy: %v", err)
+	}
+	defer rc.Close()
+
+	ImageWatermark := fileNameWithoutExtSliceNotation(client.Path) + "-watermark" + fileExtSliceNotation(client.Path)
+
+	first, err := jpeg.Decode(rc)
 	if err != nil {
 		panic("failed to decode")
 	}
-
 	watermark, err := os.Open("watermark-white.png")
 	if err != nil {
 		panic(err)
@@ -164,32 +145,64 @@ func generateWatermark(file multipart.File, filename string) string {
 	watermarkbg2 := image.Image(watermarkbg)
 	mask := image.NewUniform(color.Alpha{30})
 	draw.DrawMask(m, watermarkbg2.Bounds(), watermarkbg2, image.ZP, mask, image.ZP, draw.Over)
-	imgw, _ := os.Create(fileNameWithoutExtSliceNotation(filename) + "-watermark" + fileExtSliceNotation(filename))
+
+	imgw, _ := os.Create("ImageWatermark.jpg")
 	jpeg.Encode(imgw, m, &jpeg.Options{jpeg.DefaultQuality})
-	return (fileNameWithoutExtSliceNotation(filename) + "-watermark" + fileExtSliceNotation(filename))
-}
 
-func fileNameWithoutExtSliceNotation(fileName string) string {
-	return fileName[:len(fileName)-len(filepath.Ext(fileName))]
-}
-
-func fileExtSliceNotation(fileName string) string {
-	return filepath.Ext(fileName)
-}
-
-func resolveImageMeta(file multipart.File, object string) (int, int) {
-
-	im, _, err := image.DecodeConfig(file)
+	uploadimg, err := os.Open("ImageWatermark.jpg")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", file, err)
+		log.Fatalf("failed to open: %s", err)
 	}
-	fmt.Printf("%s %d %d\n", file, im.Width, im.Height)
 
-	return im.Width, im.Height
+	wc := clientDetail.cl.Bucket(client.BucketName).Object(ImageWatermark).NewWriter(ctx)
+	if _, err := io.Copy(wc, uploadimg); err != nil {
+		fmt.Errorf("io.Copy: %v", err)
+	}
+	if err := wc.Close(); err != nil {
+		fmt.Errorf("Writer.Close: %v", err)
+	}
+
+	c.JSON(200, gin.H{
+		"path": ImageWatermark,
+	})
+}
+
+func resolveImageMeta(c *gin.Context) {
+	var client Client
+	c.BindJSON(&client)
+	ctx := context.Background()
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*50)
+	defer cancel()
+
+	rc, err := clientDetail.cl.Bucket(client.BucketName).Object(client.Path).NewReader(ctx)
+
+	if err != nil {
+		fmt.Println("io.Copy: %v", err)
+	}
+	defer rc.Close()
+	slurp, err := ioutil.ReadAll(rc)
+	if err != nil {
+		fmt.Println("Reader.Close: %v", err)
+	}
+
+	im, _, err := image.DecodeConfig(bytes.NewReader(slurp))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", bytes.NewReader(slurp), err)
+	}
+
+	width := im.Width
+	height := im.Height
+	fs := float64(len(slurp))
+	size := HumanFileSize(fs)
+	c.JSON(200, gin.H{
+		"width":    width,
+		"height":   height,
+		"fileSize": size,
+	})
 }
 
 func HumanFileSize(size float64) string {
-	fmt.Println(size)
 	suffixes[0] = "B"
 	suffixes[1] = "KB"
 	suffixes[2] = "MB"
@@ -218,4 +231,43 @@ func Round(val float64, roundOn float64, places int) (newVal float64) {
 	}
 	newVal = round / pow
 	return
+}
+
+func fileNameWithoutExtSliceNotation(fileName string) string {
+	return fileName[:len(fileName)-len(filepath.Ext(fileName))]
+}
+
+func fileExtSliceNotation(fileName string) string {
+	return filepath.Ext(fileName)
+}
+
+type Client struct {
+	cl         *storage.Client
+	ProjectID  string `json:"projectID"`
+	BucketName string `json:"bucketName"`
+	Path       string `json:"path"`
+}
+
+type ClientImageSize struct {
+	cl         *storage.Client
+	ProjectID  string `json:"projectID"`
+	BucketName string `json:"bucketName"`
+	Path       string `json:"path"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+}
+
+var clientDetail *Client
+
+func init() {
+	os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "goimage-7fa42710ff97.json") // FILL IN WITH YOUR FILE PATH
+	client, err := storage.NewClient(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to create client: %v", err)
+	}
+
+	clientDetail = &Client{
+		cl: client,
+	}
+
 }
